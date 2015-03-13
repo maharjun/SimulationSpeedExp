@@ -4,9 +4,6 @@
 #include <chrono>
 #include <intrin.h>
 
-//#include <tbb/parallel_for.h>
-//#include <tbb/blocked_range.h>
-//#include <tbb/atomic.h>
 using namespace std;
 
 struct pseudoSyn{
@@ -16,14 +13,17 @@ struct pseudoSyn{
 	int Delay;
 };
 
-void CountingSortNormal(vector<int> &VectorToBeSorted, 
+void CountingSortNormal(vector<pseudoSyn> &VectorToBeSorted, 
 	vector<int> &SortCompartmentVector, 
-	vector<int> &OutVector, 
+	vector<pseudoSyn> &OutVector, 
 	vector<int> &EndIndexVect, 
 	int Range){
 	
+	for (int j = 0; j < Range; ++j){
+		EndIndexVect[j] = 0;
+	}
 	vector<int> StartIndexVect(Range, 0);
-	int nElems = VectorToBeSorted.size();
+	size_t nElems = VectorToBeSorted.size();
 	for (int j = 0; j < nElems; ++j){
 		EndIndexVect[SortCompartmentVector[j]]++;
 	}
@@ -46,7 +46,7 @@ void inPlaceCountingSort(vector<int> &VectorToBeSorted, vector<int> &SortCompart
 	vector<int> StartIndexVect(Range, 0);
 
 	// In Place Counting Sort
-	int nElems = VectorToBeSorted.size();
+	size_t nElems = VectorToBeSorted.size();
 	for (int j = 0; j < nElems; ++j){
 		EndIndexVect[SortCompartmentVector[j]]++;
 	}
@@ -87,10 +87,16 @@ void inPlaceCountingSort(vector<int> &VectorToBeSorted, vector<int> &SortCompart
 	}
 }
 
+inline void prefetch(const char *Pointer, int Size){
+	size_t NoofPrefetches = ((size_t)Pointer + Size - 1) / (1 << 6) - ((size_t)Pointer) / (1 << 6) + 1;
+	int offset = 0;
+	for (int i = 0; i < NoofPrefetches; ++i){
+		offset += 64;
+		_mm_prefetch(Pointer + offset, 0);
+	}
+}
 
 void SerialBinning(
-	vector<vector<int> > &WeightQueue,
-	vector<vector<int> > &NEndQueue,
 	vector<int> &Iin,
 	vector<int> &VSim,
 	vector<pseudoSyn> &SynVector, 
@@ -101,29 +107,20 @@ void SerialBinning(
 	int nBins,
 	int &TotalSpikes){
 	
-	int M = SynVector.size();
-	int N = preSynNeuronSectionBeg.size();
-	const int NCases = NeuronSelectionVector.size();
+	size_t M = SynVector.size();
+	size_t N = preSynNeuronSectionBeg.size();
+	const size_t NCases = NeuronSelectionVector.size();
 
-	WeightQueue.resize(nBins, vector<int>(0));
-	NEndQueue.resize(nBins, vector<int>(0));
 	VSim.resize(N, 0);
-	vector<vector<int> > IndexQueue(nBins, vector<int>(0));
-	vector<int> SpikeStoreWeightList;
-	vector<int> SpikeStoreNEndList;
-	vector<int> tempSpikeStoreIndexList;
-	vector<int> SpikeStoreIndexList;
+	vector<pseudoSyn> tempSpikeStoreList;
 	vector<int> SpikeStoreDelayList;
-	vector<int> EndIndexVect(nBins, 0);
+	vector<int> StartEndIndexVect(nBins * 2, 0);
+	vector<vector<pseudoSyn> > SpikeQueue(nBins, vector<pseudoSyn>(0));
+	vector<vector<int> > EndIndices(nBins, vector<int>(nBins, 0));
 
 	int CurrentQueue = 0;
 	TotalSpikes = 0;
-	int * StartPointerWeight;
-	int * StartPointerNEnd;
-	int * StartPointerIndex;
-	int * EndPointerWeight;
-	int * EndPointerNEnd;
-	int * EndPointerIndex;
+	size_t TotalSpikesTemp = 0;
 	int isdebug = false;
 	for (int i = 0; i < nSteps; ++i){
 		//if (i / 400 == 12400 / 400 || i % 400 == 0)
@@ -132,32 +129,29 @@ void SerialBinning(
 		//	isdebug = true;
 		
 		int temp = i % NCases;
-		int CurrentQSize = WeightQueue[CurrentQueue].size();
-		if (CurrentQSize){
-			StartPointerWeight = &WeightQueue[CurrentQueue][0];
-			StartPointerNEnd = &NEndQueue[CurrentQueue][0];
-			StartPointerIndex = &IndexQueue[CurrentQueue][0];
-			EndPointerWeight = &WeightQueue[CurrentQueue][CurrentQSize - 1] + 1;
-			EndPointerNEnd = &NEndQueue[CurrentQueue][CurrentQSize - 1] + 1;
-			EndPointerIndex = &IndexQueue[CurrentQueue][CurrentQSize - 1] + 1;
-		}
-		else{
-			StartPointerWeight = StartPointerNEnd = 
-			EndPointerWeight   = EndPointerNEnd   = 
-			StartPointerIndex  = EndPointerIndex  = NULL;
-		}
+		//prefetch((const char*)&SpikeQueue[CurrentQueue][0], EndIndices[CurrentQueue][0]);
 
-		for (int *iWeight = StartPointerWeight, *iNEnd = StartPointerNEnd, *iIndex = StartPointerIndex; 
-			iWeight < EndPointerWeight; ++iWeight, ++iNEnd, ++iIndex){
-			//BinVector[CurrentQueue][i] = BinVector[CurrentQueue][CurrentQSize - i - 1] + 2;
-			Iin[*iNEnd - 1] += *iNEnd;
-			Iin[*iNEnd - 1] -= *iIndex;
+		for (int j = CurrentQueue; j < nBins + CurrentQueue; ++j){
+			int ActualIndex = (j % nBins);
+			StartEndIndexVect[2 * ActualIndex + 1] = EndIndices[ActualIndex][j - CurrentQueue];
 		}
-		TotalSpikes += CurrentQSize;
-		WeightQueue[CurrentQueue].clear();
-		NEndQueue[CurrentQueue].clear();
-		IndexQueue[CurrentQueue].clear();
-
+		StartEndIndexVect[2 * CurrentQueue] = 0;
+		for (int j = CurrentQueue; j < nBins + CurrentQueue; ++j){
+			//prefetch(SpikeQueue[(j+1)%nBins])
+			int ActualIndex = (j % nBins);
+			
+			const vector<pseudoSyn>::iterator SynStartPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex];
+			const vector<pseudoSyn>::iterator SynEndPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex + 1];
+			TotalSpikesTemp += (SynEndPointer - SynStartPointer);
+			for (vector<pseudoSyn>::iterator iSyn = SynStartPointer; iSyn < SynEndPointer; ++iSyn){
+				Iin[iSyn->NEnd - 1] += iSyn->Weight;
+				Iin[iSyn->NEnd - 1] -= iSyn->Delay;
+			}
+			StartEndIndexVect[2 * ActualIndex] = StartEndIndexVect[2 * ActualIndex + 1];
+		}
+		int NextQueue = (CurrentQueue + nBins - 1) % nBins;
+		SpikeQueue[NextQueue].clear();
+		
 		for (int j = 0; j < N; ++j){
 			VSim[j] += (Iin[j] - VSim[j]);
 			if (NeuronSelectionVector[temp][j]){
@@ -165,54 +159,21 @@ void SerialBinning(
 				int kend = preSynNeuronSectionEnd[j];
 				for (; k < kend; ++k){
 					int temp = SynVector[k].Delay - 1;
-					tempSpikeStoreIndexList.push_back(k);
-					//SpikeStoreNEndList.push_back(SynVector[k].NEnd);
-					//SpikeStoreWeightList.push_back(SynVector[k].Weight);
+					tempSpikeStoreList.push_back(SynVector[k]);
 					SpikeStoreDelayList.push_back(temp);
 				}
 			}
 		}
-		CountingSortNormal(tempSpikeStoreIndexList, SpikeStoreDelayList,
-			SpikeStoreIndexList, EndIndexVect, nBins);
-
-		// creating arrays after having sorted
-		for (int j = 0; j < nBins; ++j){
-			int Start = (j == 0) ? 0 : EndIndexVect[j - 1];
-			int End = EndIndexVect[j];
-			int CurrentBin = (j + 1 + CurrentQueue) % nBins;
-			for (int k = Start; k < End; ++k){
-				WeightQueue[CurrentBin].push_back(SynVector[SpikeStoreIndexList[k]].Weight);
-			}
-		}
-		for (int j = 0; j < nBins; ++j){
-			int Start = (j == 0) ? 0 : EndIndexVect[j - 1];
-			int End = EndIndexVect[j];
-			int CurrentBin = (j + 1 + CurrentQueue) % nBins;
-			for (int k = Start; k < End; ++k){
-				NEndQueue[CurrentBin].push_back(SynVector[SpikeStoreIndexList[k]].NEnd);
-			}
-		}
-		for (int j = 0; j < nBins; ++j){
-			int Start = (j == 0) ? 0 : EndIndexVect[j - 1];
-			int End = EndIndexVect[j];
-			int CurrentBin = (j + 1 + CurrentQueue) % nBins;
-			for (int k = Start; k < End; ++k){
-				IndexQueue[CurrentBin].push_back(SpikeStoreIndexList[k]);
-			}
-		}
+		CountingSortNormal(tempSpikeStoreList, SpikeStoreDelayList,
+			SpikeQueue[NextQueue], EndIndices[NextQueue], nBins);
 		
-		tempSpikeStoreIndexList.clear();
+		size_t CurrentQSize = tempSpikeStoreList.size();
+		tempSpikeStoreList.clear();
 		SpikeStoreDelayList.clear();
-		for (int j = 0; j < nBins; ++j){
-			EndIndexVect[j] = 0;
-		}
-		
-		CurrentQueue = (CurrentQueue + 1) % nBins;
+		TotalSpikes += CurrentQSize;
+		CurrentQueue = NextQueue;
 	}
-
-	for (int i = 0; i < nBins; ++i){
-		TotalSpikes += WeightQueue[i].size();
-	}
+	cout << "Number of actual iterations = " << TotalSpikesTemp;
 }
 
 int main(){
@@ -280,8 +241,6 @@ int main(){
 	auto TBeg = chrono::system_clock::now();
 
 	SerialBinning(
-		WeightQueue,
-		NEndQueue,
 		pseudoIin,
 		pseudoV,
 		Synapses,
