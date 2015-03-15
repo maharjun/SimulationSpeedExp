@@ -3,7 +3,7 @@
 #include <random>
 #include <chrono>
 #include <intrin.h>
-
+#include "..\Headers\MexMem.hpp"
 using namespace std;
 
 struct pseudoSyn{
@@ -13,16 +13,25 @@ struct pseudoSyn{
 	int Delay;
 };
 
-void CountingSortNormal(vector<pseudoSyn> &VectorToBeSorted, 
-	vector<int> &SortCompartmentVector, 
-	vector<pseudoSyn> &OutVector, 
-	vector<int> &EndIndexVect, 
+inline void prefetch(const char *Pointer, int Size){
+	size_t NoofPrefetches = ((size_t)Pointer + Size - 1) / (1 << 6) - ((size_t)Pointer) / (1 << 6) + 1;
+	int offset = 0;
+	for (int i = 0; i < NoofPrefetches; ++i){
+		offset += 64;
+		_mm_prefetch(Pointer + offset, 2);
+	}
+}
+
+void CountingSortNormal(MexVector<pseudoSyn> &VectorToBeSorted, 
+	MexVector<int> &SortCompartmentVector, 
+	MexVector<pseudoSyn> &OutVector, 
+	MexVector<int> &EndIndexVect, 
 	int Range){
 	
 	for (int j = 0; j < Range; ++j){
 		EndIndexVect[j] = 0;
 	}
-	vector<int> StartIndexVect(Range, 0);
+	MexVector<int> StartIndexVect(Range, 0);
 	size_t nElems = VectorToBeSorted.size();
 	for (int j = 0; j < nElems; ++j){
 		EndIndexVect[SortCompartmentVector[j]]++;
@@ -39,11 +48,55 @@ void CountingSortNormal(vector<pseudoSyn> &VectorToBeSorted,
 	}
 }
 
-void inPlaceCountingSort(vector<int> &VectorToBeSorted, vector<int> &SortCompartmentVector, vector<int> &EndIndexVect, int Range){
+void CountingSortCached(MexVector<pseudoSyn> &VectorToBeSorted,
+	//MexVector<int> &SortCompartmentVector,
+	MexVector<pseudoSyn> &OutVector,
+	MexVector<int> &EndIndexVect,
+	int Range){
+	const int CacheSize = 32;
+	MexVector<pseudoSyn> CacheSynVect(Range * CacheSize);
+	MexVector<size_t> CacheVectIndices(Range);
+
+	for (int j = 0; j < Range; ++j){
+		EndIndexVect[j] = 0;
+	}
+	MexVector<int> StartIndexVect(Range, 0);
+	size_t nElems = VectorToBeSorted.size();
+	for (int j = 0; j < nElems; ++j){
+		EndIndexVect[VectorToBeSorted[j].Delay - 1]++;
+	}
+	for (int j = 1; j < Range; ++j){
+		EndIndexVect[j] += EndIndexVect[j - 1];
+		StartIndexVect[j] = EndIndexVect[j - 1];
+	}
+	if (OutVector.capacity() != VectorToBeSorted.capacity()) OutVector.reserve(VectorToBeSorted.capacity());
+	if (OutVector.size() != nElems) OutVector.resize(nElems);
+	for (int j = 0; j < nElems; ++j){
+		int CurrElem = VectorToBeSorted[j].Delay - 1;
+		if (CacheVectIndices[CurrElem] == CacheSize){
+			//prefetch(reinterpret_cast<const char*>(&OutVector + StartIndexVect[CurrElem] + CacheSize), CacheSize * sizeof(pseudoSyn));
+			for (int k = StartIndexVect[CurrElem], l = CurrElem * CacheSize; k < StartIndexVect[CurrElem] + CacheSize; ++k, ++l){
+				OutVector[k] = CacheSynVect[l];
+			}
+			CacheVectIndices[CurrElem] = 0;
+			StartIndexVect[CurrElem] += CacheSize;
+		}
+		CacheSynVect[CurrElem * CacheSize + CacheVectIndices[CurrElem]] = VectorToBeSorted[j];
+		++CacheVectIndices[CurrElem];
+	}
+	for (int i = 0; i < Range; ++i){
+		for (int j = StartIndexVect[i], k = i * CacheSize; j < StartIndexVect[i] + CacheVectIndices[i]; ++j, ++k){
+			OutVector[j] = CacheSynVect[k];
+		}
+	}
+
+}
+
+void inPlaceCountingSort(MexVector<int> &VectorToBeSorted, MexVector<int> &SortCompartmentVector, MexVector<int> &EndIndexVect, int Range){
 	//_mm_prefetch((const char*)&VectorToBeSorted[0], 0);
 	//_mm_prefetch((const char*)&SortCompartmentVector[0], 0);
-	//EndIndexVect = vector<int>(Range, 0);    // Used for counting sort
-	vector<int> StartIndexVect(Range, 0);
+	//EndIndexVect = MexVector<int>(Range, 0);    // Used for counting sort
+	MexVector<int> StartIndexVect(Range, 0);
 
 	// In Place Counting Sort
 	size_t nElems = VectorToBeSorted.size();
@@ -60,10 +113,10 @@ void inPlaceCountingSort(vector<int> &VectorToBeSorted, vector<int> &SortCompart
 	int CurrentValue;
 	for (int j = 0; j < Range; ++j)
 		if (StartIndexVect[j] != EndIndexVect[j]){
-		CycleStart = j;
-		CurrentDelayValue = SortCompartmentVector[StartIndexVect[CycleStart]];
-		CurrentValue = VectorToBeSorted[StartIndexVect[CycleStart]];
-		break;
+			CycleStart = j;
+			CurrentDelayValue = SortCompartmentVector[StartIndexVect[CycleStart]];
+			CurrentValue = VectorToBeSorted[StartIndexVect[CycleStart]];
+			break;
 		}
 	while (CycleStart < Range){
 		int IndextoStoreIn = StartIndexVect[CurrentDelayValue];
@@ -87,22 +140,13 @@ void inPlaceCountingSort(vector<int> &VectorToBeSorted, vector<int> &SortCompart
 	}
 }
 
-inline void prefetch(const char *Pointer, int Size){
-	size_t NoofPrefetches = ((size_t)Pointer + Size - 1) / (1 << 6) - ((size_t)Pointer) / (1 << 6) + 1;
-	int offset = 0;
-	for (int i = 0; i < NoofPrefetches; ++i){
-		offset += 64;
-		_mm_prefetch(Pointer + offset, 0);
-	}
-}
-
 void SerialBinning(
-	vector<int> &Iin,
-	vector<int> &VSim,
-	vector<pseudoSyn> &SynVector, 
-	vector<int> &preSynNeuronSectionBeg,
-	vector<int> &preSynNeuronSectionEnd,
-	vector<vector<int> > &NeuronSelectionVector,
+	MexVector<int> &Iin,
+	MexVector<int> &VSim,
+	MexVector<pseudoSyn> &SynVector, 
+	MexVector<int> &preSynNeuronSectionBeg,
+	MexVector<int> &preSynNeuronSectionEnd,
+	MexVector<MexVector<int> > &NeuronSelectionVector,
 	int nSteps,
 	int nBins,
 	int &TotalSpikes){
@@ -112,11 +156,13 @@ void SerialBinning(
 	const size_t NCases = NeuronSelectionVector.size();
 
 	VSim.resize(N, 0);
-	vector<pseudoSyn> tempSpikeStoreList;
-	vector<int> SpikeStoreDelayList;
-	vector<int> StartEndIndexVect(nBins * 2, 0);
-	vector<vector<pseudoSyn> > SpikeQueue(nBins, vector<pseudoSyn>(0));
-	vector<vector<int> > EndIndices(nBins, vector<int>(nBins, 0));
+	MexVector<pseudoSyn> tempSpikeStoreList;
+	MexVector<int> SpikeStoreDelayList;
+	MexVector<int> StartEndIndexVect(nBins * 2, 0);
+	MexVector<MexVector<pseudoSyn> > SpikeQueue(nBins, MexVector<pseudoSyn>(0));
+	MexVector<MexVector<int> > EndIndices(nBins, MexVector<int>(nBins, 0));
+	MexVector<size_t> CurrSpikingNeurons;
+	CurrSpikingNeurons.reserve(N * 4);
 
 	int CurrentQueue = 0;
 	TotalSpikes = 0;
@@ -137,13 +183,12 @@ void SerialBinning(
 		}
 		StartEndIndexVect[2 * CurrentQueue] = 0;
 		for (int j = CurrentQueue; j < nBins + CurrentQueue; ++j){
-			//prefetch(SpikeQueue[(j+1)%nBins])
 			int ActualIndex = (j % nBins);
 			
-			const vector<pseudoSyn>::iterator SynStartPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex];
-			const vector<pseudoSyn>::iterator SynEndPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex + 1];
+			const MexVector<pseudoSyn>::iterator SynStartPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex];
+			const MexVector<pseudoSyn>::iterator SynEndPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex + 1];
 			TotalSpikesTemp += (SynEndPointer - SynStartPointer);
-			for (vector<pseudoSyn>::iterator iSyn = SynStartPointer; iSyn < SynEndPointer; ++iSyn){
+			for (MexVector<pseudoSyn>::iterator iSyn = SynStartPointer; iSyn < SynEndPointer; ++iSyn){
 				Iin[iSyn->NEnd - 1] += iSyn->Weight;
 				Iin[iSyn->NEnd - 1] -= iSyn->Delay;
 			}
@@ -151,25 +196,64 @@ void SerialBinning(
 		}
 		int NextQueue = (CurrentQueue + nBins - 1) % nBins;
 		SpikeQueue[NextQueue].clear();
-		
-		for (int j = 0; j < N; ++j){
+		int CacheBuffering = 16;	// Each time a cache of size 64 will be pulled in 
+		size_t TotalNoofCurrentSpikes = 0;
+		for (int j = 0, CurrentContig = -1, PrevSpikedNeuron = -1; j < N; ++j){
 			VSim[j] += (Iin[j] - VSim[j]);
 			if (NeuronSelectionVector[temp][j]){
 				int k = preSynNeuronSectionBeg[j];
 				int kend = preSynNeuronSectionEnd[j];
-				for (; k < kend; ++k){
-					int temp = SynVector[k].Delay - 1;
-					tempSpikeStoreList.push_back(SynVector[k]);
-					SpikeStoreDelayList.push_back(temp);
+				if (k != kend){
+					TotalNoofCurrentSpikes += kend - k;
+					if (CurrentContig == -1 || 
+						preSynNeuronSectionEnd[PrevSpikedNeuron] != preSynNeuronSectionBeg[j]){
+						CurrentContig++;
+						CurrSpikingNeurons.push_back(k);
+						CurrSpikingNeurons.push_back(kend - k);
+						CurrSpikingNeurons.push_back(TotalNoofCurrentSpikes - kend + k);
+						CurrSpikingNeurons.push_back(reinterpret_cast<size_t>(&SynVector[0] + k));
+					}
+					else{
+						CurrSpikingNeurons[4 * CurrentContig + 1] += kend - k;
+					}
+					PrevSpikedNeuron = j;
 				}
 			}
 		}
-		CountingSortNormal(tempSpikeStoreList, SpikeStoreDelayList,
+		size_t NoofContigRegions = CurrSpikingNeurons.size() / 4;
+		if (TotalNoofCurrentSpikes > tempSpikeStoreList.capacity()){
+			int currCapacity = tempSpikeStoreList.capacity();
+			while (TotalNoofCurrentSpikes > currCapacity){
+				if (currCapacity == 0)
+					currCapacity = 4;
+				else
+					currCapacity = currCapacity + (currCapacity >> 1);
+			}
+			tempSpikeStoreList.reserve(currCapacity);
+		}
+			
+		tempSpikeStoreList.resize(TotalNoofCurrentSpikes);
+		pseudoSyn* tempPtr = &tempSpikeStoreList[0];
+		for (size_t j = 0; j < NoofContigRegions; ++j){
+			size_t SizeofContigRegion = CurrSpikingNeurons[4 * j + 1];
+			//if (j < NoofContigRegions - 1){
+			//	pseudoSyn *Ptrb4NextContigRegion = reinterpret_cast<pseudoSyn*>(CurrSpikingNeurons[4 * j + 3]);
+			//	prefetch((const char*)Ptrb4NextContigRegion, SizeofContigRegion*sizeof(pseudoSyn));
+			//}
+			pseudoSyn *tempPtrSynVect = &SynVector[CurrSpikingNeurons[4 * j]];
+			for (int k = 0; k < SizeofContigRegion; ++k){
+				tempPtr[k] = tempPtrSynVect[k];
+			}
+			tempPtr += SizeofContigRegion;
+		}
+
+		CountingSortCached(tempSpikeStoreList, /*SpikeStoreDelayList,*/
 			SpikeQueue[NextQueue], EndIndices[NextQueue], nBins);
 		
 		size_t CurrentQSize = tempSpikeStoreList.size();
+		CurrSpikingNeurons.clear();
 		tempSpikeStoreList.clear();
-		SpikeStoreDelayList.clear();
+		//SpikeStoreDelayList.clear();
 		TotalSpikes += CurrentQSize;
 		CurrentQueue = NextQueue;
 	}
@@ -183,7 +267,7 @@ int main(){
 	int Range = onemsbyTstep*20;
 	int nSteps = 8000 * onemsbyTstep;
 	float ProbofSelecting = 1.0f / 50;
-	float ProbofFiring = 1.0f / 2000;
+	float ProbofFiring = 1.0f / 1000;
 	float LimitProbofFiring = (1.0f / 2) / onemsbyTstep;
 	int TotalSpikes;
 	RandGen.seed(28);
@@ -191,15 +275,15 @@ int main(){
 	uniform_real_distribution<double> RandFloatDist(0.0f, 1.0f);
 	bernoulli_distribution BerDist(ProbofSelecting);
 
-	vector<vector<int> > NeuronSelectionVector(8, vector<int>(N,0));
-	vector<int> pseudoIin(N, 0);
-	vector<int> pseudoV(N, 0);
-	vector<int> preSynNeuronSectionBeg(N, -1);
-	vector<int> preSynNeuronSectionEnd(N, -1);
-	vector<int> NoofOutSyns(N, 0);
-	vector<int> NoofInSyns(N, 0);
-	vector<vector<int> > WeightQueue, NEndQueue;
-	vector<pseudoSyn> Synapses;
+	MexVector<MexVector<int> > NeuronSelectionVector(8, MexVector<int>(N,0));
+	MexVector<int> pseudoIin(N, 0);
+	MexVector<int> pseudoV(N, 0);
+	MexVector<int> preSynNeuronSectionBeg(N, -1);
+	MexVector<int> preSynNeuronSectionEnd(N, -1);
+	MexVector<int> NoofOutSyns(N, 0);
+	MexVector<int> NoofInSyns(N, 0);
+	MexVector<MexVector<int> > WeightQueue, NEndQueue;
+	MexVector<pseudoSyn> Synapses;
 
 	// filling preSynNeuronSectionBeg, preSynNeuronSectionBeg, and creating network.
 	int TotalNoofSyns = 0;
@@ -229,7 +313,7 @@ int main(){
 	}
 
 	// filling up neuron selections
-	vector<float> tempRandVect(N);
+	MexVector<float> tempRandVect(N);
 	 
 	for (int i = 0; i < 8; ++i){
 		for (int j = 0; j < N; ++j){
@@ -261,6 +345,7 @@ int main(){
 			}
 		}
 	}
+	cout << "Just 4 Kicks: " << pseudoV[1] << pseudoIin[1] << endl;
 	TotalSpikesEstimate = (float)(TotalSpikesEstimate) / 8 * nSteps;
 	if (WeightQueue.size() == Range){
 		for (int i = 0; i < Range; ++i)
