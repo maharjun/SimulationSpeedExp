@@ -3,7 +3,7 @@
   <ImportGroup Label="PropertySheets" />
   <PropertyGroup Label="UserMacros" />
   <PropertyGroup>
-    <TargetExt>.mexw64</TargetExt>
+    <TargetExt>.exe</TargetExt>
     <IncludePath>$(MATLAB_ROOT)\extern\include;$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Label="Configuration">

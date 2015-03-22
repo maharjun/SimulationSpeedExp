@@ -198,6 +198,18 @@ public:
 			++Array_Last;
 		}
 	}
+	inline void push_size(size_t Increment){
+		if (Array_Last + Increment> Array_End){
+			size_t CurrCapacity = this->capacity();
+			size_t CurrSize = this->size();
+			CurrCapacity = CurrCapacity ? CurrCapacity : 4;
+			while (CurrCapacity <= CurrSize + Increment){
+				CurrCapacity += (CurrCapacity >> 1);
+			}
+			reserve(CurrCapacity);
+		}
+		Array_Last += Increment;
+	}
 	inline void copyArray(size_t Position, T* ArrBegin, size_t NumElems) const{
 		if (Position + NumElems > this->size){
 			throw ExOps::EXCEPTION_CONST_MOD;

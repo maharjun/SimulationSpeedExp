@@ -122,6 +122,11 @@
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
       <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <OptimizeForWindowsApplication>false</OptimizeForWindowsApplication>
+      <Parallelization>false</Parallelization>
+      <UseIntelOptimizedHeaders>false</UseIntelOptimizedHeaders>
+      <GenerateAlternateCodePaths>SSE41</GenerateAlternateCodePaths>
+      <UseProcessorExtensions>SSE41</UseProcessorExtensions>
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>

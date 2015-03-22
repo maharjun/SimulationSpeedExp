@@ -3,6 +3,13 @@
 #include <random>
 #include <chrono>
 #include <intrin.h>
+#include <emmintrin.h>
+
+#include <tbb/parallel_reduce.h>
+#include <tbb/blocked_range.h>
+#include <tbb/task_group.h>
+#include <smmintrin.h>
+
 #include "..\Headers\MexMem.hpp"
 using namespace std;
 
@@ -73,23 +80,32 @@ void CountingSortCached(MexVector<pseudoSyn> &VectorToBeSorted,
 	if (OutVector.size() != nElems) OutVector.resize(nElems);
 	for (int j = 0; j < nElems; ++j){
 		int CurrElem = VectorToBeSorted[j].Delay - 1;
-		if (CacheVectIndices[CurrElem] == CacheSize){
+
+		size_t *CurrentIndexPtr = &CacheVectIndices[CurrElem];
+		size_t CurrentIndex = *CurrentIndexPtr;
+		if (CurrentIndex == CacheSize){
 			//prefetch(reinterpret_cast<const char*>(&OutVector + StartIndexVect[CurrElem] + CacheSize), CacheSize * sizeof(pseudoSyn));
-			for (int k = StartIndexVect[CurrElem], l = CurrElem * CacheSize; k < StartIndexVect[CurrElem] + CacheSize; ++k, ++l){
-				OutVector[k] = CacheSynVect[l];
+			__m128i* kbeg = reinterpret_cast<__m128i*>(&OutVector[StartIndexVect[CurrElem]]);
+			__m128i* kend = reinterpret_cast<__m128i*>(&OutVector[StartIndexVect[CurrElem]]) + CacheSize;
+			__m128i* lbeg = reinterpret_cast<__m128i*>(&CacheSynVect[CurrElem * CacheSize]);
+
+			for (__m128i* k = kbeg, *l = lbeg; k < kend; k++, l++){
+				_mm_stream_si128(k, _mm_load_si128(l)); 
 			}
-			CacheVectIndices[CurrElem] = 0;
+			CurrentIndex = 0;
+			*CurrentIndexPtr = 0;
 			StartIndexVect[CurrElem] += CacheSize;
 		}
-		CacheSynVect[CurrElem * CacheSize + CacheVectIndices[CurrElem]] = VectorToBeSorted[j];
-		++CacheVectIndices[CurrElem];
+		_mm_store_si128( (__m128i*)CacheSynVect.begin() + CurrElem * CacheSize + CurrentIndex,
+			_mm_load_si128((__m128i*)VectorToBeSorted.begin() + j));
+		++(*CurrentIndexPtr);
 	}
 	for (int i = 0; i < Range; ++i){
 		for (int j = StartIndexVect[i], k = i * CacheSize; j < StartIndexVect[i] + CacheVectIndices[i]; ++j, ++k){
 			OutVector[j] = CacheSynVect[k];
 		}
 	}
-
+	_mm_mfence();
 }
 
 void inPlaceCountingSort(MexVector<int> &VectorToBeSorted, MexVector<int> &SortCompartmentVector, MexVector<int> &EndIndexVect, int Range){
@@ -233,20 +249,32 @@ void SerialBinning(
 		}
 			
 		tempSpikeStoreList.resize(TotalNoofCurrentSpikes);
-		pseudoSyn* tempPtr = &tempSpikeStoreList[0];
+		__m128i* tempPtr = reinterpret_cast<__m128i*>(&tempSpikeStoreList[0]);
 		for (size_t j = 0; j < NoofContigRegions; ++j){
 			size_t SizeofContigRegion = CurrSpikingNeurons[4 * j + 1];
 			//if (j < NoofContigRegions - 1){
 			//	pseudoSyn *Ptrb4NextContigRegion = reinterpret_cast<pseudoSyn*>(CurrSpikingNeurons[4 * j + 3]);
 			//	prefetch((const char*)Ptrb4NextContigRegion, SizeofContigRegion*sizeof(pseudoSyn));
 			//}
-			pseudoSyn *tempPtrSynVect = &SynVector[CurrSpikingNeurons[4 * j]];
-			for (int k = 0; k < SizeofContigRegion; ++k){
-				tempPtr[k] = tempPtrSynVect[k];
-			}
-			tempPtr += SizeofContigRegion;
-		}
+			__m128i *ContigRegionBeg = reinterpret_cast<__m128i*>(&SynVector[CurrSpikingNeurons[4 * j]]);
+			__m128i *ContigRegionEnd = reinterpret_cast<__m128i*>(&SynVector[CurrSpikingNeurons[4 * j]])
+			                                                      + SizeofContigRegion;
+			
+			// 64 aligned pointers
+			__m128i *ContigRegionBeg64 = reinterpret_cast<__m128i*>
+											(((reinterpret_cast<size_t>(ContigRegionBeg) >> 6) + 1) << 6);
+			__m128i *ContigRegionEnd64 = reinterpret_cast<__m128i*>
+											((reinterpret_cast<size_t>(ContigRegionEnd) >> 6) << 6);
 
+			// Streaming 64 aligned
+			for (__m128i *ContigRegionPtr = ContigRegionBeg; 
+				ContigRegionPtr < ContigRegionEnd; 
+				++ContigRegionPtr, ++tempPtr){
+				__m128i xmm0 = _mm_load_si128(ContigRegionPtr);
+				_mm_stream_si128(tempPtr, xmm0);
+			}
+
+		}
 		CountingSortCached(tempSpikeStoreList, /*SpikeStoreDelayList,*/
 			SpikeQueue[NextQueue], EndIndices[NextQueue], nBins);
 		
@@ -260,6 +288,138 @@ void SerialBinning(
 	cout << "Number of actual iterations = " << TotalSpikesTemp;
 }
 
+void CachedBinning(
+	MexVector<int> &Iin,
+	MexVector<int> &VSim,
+	MexVector<pseudoSyn> &SynVector,
+	MexVector<int> &preSynNeuronSectionBeg,
+	MexVector<int> &preSynNeuronSectionEnd,
+	MexVector<MexVector<int> > &NeuronSelectionVector,
+	int nSteps,
+	int nBins,
+	int &TotalSpikes
+	){
+
+	size_t M = SynVector.size();
+	size_t N = preSynNeuronSectionBeg.size();
+	const size_t NCases = NeuronSelectionVector.size();
+
+	VSim.resize(N, 0);
+	MexVector<pseudoSyn> tempSpikeStoreList;
+	MexVector<int> SpikeStoreDelayList;
+	MexVector<int> StartEndIndexVect(nBins * 2, 0);
+	MexVector<MexVector<pseudoSyn> > SpikeQueue(nBins, MexVector<pseudoSyn>(0));
+	MexVector<MexVector<int> > EndIndices(nBins, MexVector<int>(nBins, 0));
+	MexVector<size_t> CurrSpikingNeurons;
+	CurrSpikingNeurons.reserve(N * 4);
+
+	int CurrentQueue = 0;
+	TotalSpikes = 0;
+	size_t TotalSpikesTemp = 0;
+	int isdebug = false;
+	for (int i = 0; i < nSteps; ++i){
+		//if (i / 400 == 12400 / 400 || i % 400 == 0)
+		//	cout << i << " steps complete." << endl;
+		//if (i == 12424)
+		//	isdebug = true;
+
+		int temp = i % NCases;
+		//prefetch((const char*)&SpikeQueue[CurrentQueue][0], EndIndices[CurrentQueue][0]);
+
+		for (int j = CurrentQueue; j < nBins + CurrentQueue; ++j){
+			int ActualIndex = (j % nBins);
+			StartEndIndexVect[2 * ActualIndex + 1] = EndIndices[ActualIndex][j - CurrentQueue];
+		}
+		StartEndIndexVect[2 * CurrentQueue] = 0;
+		for (int j = CurrentQueue; j < nBins + CurrentQueue; ++j){
+			int ActualIndex = (j % nBins);
+
+			const MexVector<pseudoSyn>::iterator SynStartPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex];
+			const MexVector<pseudoSyn>::iterator SynEndPointer = SpikeQueue[ActualIndex].begin() + StartEndIndexVect[2 * ActualIndex + 1];
+			TotalSpikesTemp += (SynEndPointer - SynStartPointer);
+			for (MexVector<pseudoSyn>::iterator iSyn = SynStartPointer; iSyn < SynEndPointer; ++iSyn){
+				Iin[iSyn->NEnd - 1] += iSyn->Weight;
+				Iin[iSyn->NEnd - 1] -= iSyn->Delay;
+			}
+			StartEndIndexVect[2 * ActualIndex] = StartEndIndexVect[2 * ActualIndex + 1];
+		}
+		int NextQueue = (CurrentQueue + nBins - 1) % nBins;
+		SpikeQueue[NextQueue].clear();
+		int CacheBuffering = 16;	// Each time a cache of size 64 will be pulled in 
+		size_t TotalNoofCurrentSpikes = 0;
+		for (int j = 0, CurrentContig = -1, PrevSpikedNeuron = -1; j < N; ++j){
+			VSim[j] += (Iin[j] - VSim[j]);
+			if (NeuronSelectionVector[temp][j]){
+				int k = preSynNeuronSectionBeg[j];
+				int kend = preSynNeuronSectionEnd[j];
+				if (k != kend){
+					TotalNoofCurrentSpikes += kend - k;
+					if (CurrentContig == -1 ||
+						preSynNeuronSectionEnd[PrevSpikedNeuron] != preSynNeuronSectionBeg[j]){
+						CurrentContig++;
+						CurrSpikingNeurons.push_back(k);
+						CurrSpikingNeurons.push_back(kend - k);
+						CurrSpikingNeurons.push_back(TotalNoofCurrentSpikes - kend + k);
+						CurrSpikingNeurons.push_back(reinterpret_cast<size_t>(&SynVector[0] + k));
+					}
+					else{
+						CurrSpikingNeurons[4 * CurrentContig + 1] += kend - k;
+					}
+					PrevSpikedNeuron = j;
+				}
+			}
+		}
+		size_t NoofContigRegions = CurrSpikingNeurons.size() / 4;
+		if (TotalNoofCurrentSpikes > tempSpikeStoreList.capacity()){
+			int currCapacity = tempSpikeStoreList.capacity();
+			while (TotalNoofCurrentSpikes > currCapacity){
+				if (currCapacity == 0)
+					currCapacity = 4;
+				else
+					currCapacity = currCapacity + (currCapacity >> 1);
+			}
+			tempSpikeStoreList.reserve(currCapacity);
+		}
+
+		tempSpikeStoreList.resize(TotalNoofCurrentSpikes);
+		__m128i* tempPtr = reinterpret_cast<__m128i*>(&tempSpikeStoreList[0]);
+		for (size_t j = 0; j < NoofContigRegions; ++j){
+			size_t SizeofContigRegion = CurrSpikingNeurons[4 * j + 1];
+			//if (j < NoofContigRegions - 1){
+			//	pseudoSyn *Ptrb4NextContigRegion = reinterpret_cast<pseudoSyn*>(CurrSpikingNeurons[4 * j + 3]);
+			//	prefetch((const char*)Ptrb4NextContigRegion, SizeofContigRegion*sizeof(pseudoSyn));
+			//}
+			__m128i *ContigRegionBeg = reinterpret_cast<__m128i*>(&SynVector[CurrSpikingNeurons[4 * j]]);
+			__m128i *ContigRegionEnd = reinterpret_cast<__m128i*>(&SynVector[CurrSpikingNeurons[4 * j]])
+				+ SizeofContigRegion;
+
+			// 64 aligned pointers
+			__m128i *ContigRegionBeg64 = reinterpret_cast<__m128i*>
+				(((reinterpret_cast<size_t>(ContigRegionBeg) >> 6) + 1) << 6);
+			__m128i *ContigRegionEnd64 = reinterpret_cast<__m128i*>
+				((reinterpret_cast<size_t>(ContigRegionEnd) >> 6) << 6);
+
+			// Streaming 64 aligned
+			for (__m128i *ContigRegionPtr = ContigRegionBeg;
+				ContigRegionPtr < ContigRegionEnd;
+				++ContigRegionPtr, ++tempPtr){
+				__m128i xmm0 = _mm_load_si128(ContigRegionPtr);
+				_mm_stream_si128(tempPtr, xmm0);
+			}
+
+		}
+		CountingSortCached(tempSpikeStoreList, /*SpikeStoreDelayList,*/
+			SpikeQueue[NextQueue], EndIndices[NextQueue], nBins);
+
+		size_t CurrentQSize = tempSpikeStoreList.size();
+		CurrSpikingNeurons.clear();
+		tempSpikeStoreList.clear();
+		//SpikeStoreDelayList.clear();
+		TotalSpikes += CurrentQSize;
+		CurrentQueue = NextQueue;
+	}
+	cout << "Number of actual iterations = " << TotalSpikesTemp;
+}
 int main(){
 	mt19937 RandGen;
 	int N = 10000;
