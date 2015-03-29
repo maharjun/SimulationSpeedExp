@@ -2,7 +2,6 @@
 #include <vector>
 #include <random>
 #include <chrono>
-#include <intrin.h>
 #include <emmintrin.h>
 
 #include <tbb/parallel_reduce.h>
@@ -16,8 +15,14 @@ using namespace std;
 struct pseudoSyn{
 	int NStart;
 	int NEnd;
-	int Weight;
 	int Delay;
+	int Weight;
+};
+
+struct pseudoSynRef{
+	int  NStart;
+	int  NEnd;
+	int* WeightPtr;
 };
 
 inline void prefetch(const char *Pointer, int Size){
@@ -232,7 +237,7 @@ void CachedBinning(
 	const size_t NCases = NeuronSelectionVector.size();
 
 	VSim.resize(N, 0);
-	MexVector<MexVector<pseudoSyn> > SpikeQueue(nBins, MexVector<pseudoSyn>(0));
+	MexVector<MexVector<pseudoSynRef> > SpikeQueue(nBins, MexVector<pseudoSynRef>(0));
 
 	int CurrentQueue = 0;
 	TotalSpikes = 0;
@@ -242,7 +247,7 @@ void CachedBinning(
 		int temp = i % NCases;
 
 		int CurrentQSize = SpikeQueue[CurrentQueue].size();
-		MexVector<pseudoSyn>::iterator StartPointer, EndPointer;
+		MexVector<pseudoSynRef>::iterator StartPointer, EndPointer;
 		if (CurrentQSize){
 			StartPointer = SpikeQueue[CurrentQueue].begin();
 			EndPointer = SpikeQueue[CurrentQueue].end();
@@ -251,10 +256,11 @@ void CachedBinning(
 			StartPointer = EndPointer = NULL;
 		}
 
-		for (MexVector<pseudoSyn>::iterator iSpike = StartPointer;
+		for (MexVector<pseudoSynRef>::iterator iSpike = StartPointer;
 			iSpike < EndPointer; ++iSpike){
-			Iin[iSpike->NEnd - 1] += iSpike->Weight;
-			Iin[iSpike->NStart - 1] -= iSpike->Delay;
+			int temp = *(iSpike->WeightPtr);
+			Iin[iSpike->NEnd - 1] += temp;
+			*(iSpike->WeightPtr) = -temp + Iin[iSpike->NEnd - 1];
 		}
 
 		TotalSpikes += CurrentQSize;
@@ -262,7 +268,7 @@ void CachedBinning(
 		int NextQueue = (CurrentQueue + 1) % nBins;
 
 		int CacheBuffering = 64;	// Each time a cache of size 64 will be pulled in 
-		MexVector<pseudoSyn> BinningBuffer(CacheBuffering*nBins);
+		MexVector<__m128i> BinningBuffer(CacheBuffering*nBins);	//each element is 16 bytes
 		MexVector<int> BufferInsertIndex(nBins, 0);
 
 		for (int j = 0; j < N; ++j){
@@ -273,6 +279,7 @@ void CachedBinning(
 				if (k != kend){
 					int NoofCurrNeuronSpikes = kend - k;
 					MexVector<pseudoSyn>::iterator iSyn = SynVector.begin() + k;
+
 					MexVector<pseudoSyn>::iterator iSynEnd = SynVector.begin() + kend;
 					//TotalSpikesTemp += iSynEnd - iSyn;
 					for (; iSyn < iSynEnd; ++iSyn){
@@ -292,7 +299,10 @@ void CachedBinning(
 							BufferIndex = 0;
 							*BufferIndexPtr = 0;
 						}
-						BinningBuffer[CurrIndex*CacheBuffering + BufferIndex] = *iSyn;
+						__m128i xmm1 = _mm_load_si128((__m128i*)iSyn);
+						__m128i xmm2; xmm2.m128i_i64[0] = reinterpret_cast<size_t>(iSyn)+offsetof(pseudoSyn, Weight);
+						
+						BinningBuffer[CurrIndex*CacheBuffering + BufferIndex] = _mm_unpacklo_epi64(xmm1, xmm2);
 						++*BufferIndexPtr;
 					}
 				}
