@@ -243,11 +243,16 @@ void CachedBinning(
 	TotalSpikes = 0;
 	//size_t TotalSpikesTemp = 0;
 	int isdebug = false;
+	int SpikeQueueProcTotal = 0, SpikeStoreTotal = 0;
+	chrono::system_clock::time_point SpikeQueueProcBeg, SpikeQueueProcEnd;
+	chrono::system_clock::time_point SpikeStoreBeg, SpikeStoreEnd;
+
 	for (int i = 0; i < nSteps; ++i){
 		int temp = i % NCases;
 
 		int CurrentQSize = SpikeQueue[CurrentQueue].size();
 		MexVector<pseudoSynRef>::iterator StartPointer, EndPointer;
+		SpikeQueueProcBeg = chrono::system_clock::now();
 		if (CurrentQSize){
 			StartPointer = SpikeQueue[CurrentQueue].begin();
 			EndPointer = SpikeQueue[CurrentQueue].end();
@@ -262,6 +267,8 @@ void CachedBinning(
 			Iin[iSpike->NEnd - 1] += temp;
 			*(iSpike->WeightPtr) = -temp + Iin[iSpike->NEnd - 1];
 		}
+		SpikeQueueProcEnd = chrono::system_clock::now();
+		SpikeQueueProcTotal += chrono::duration_cast<chrono::microseconds>(SpikeQueueProcEnd - SpikeQueueProcBeg).count();
 
 		TotalSpikes += CurrentQSize;
 		SpikeQueue[CurrentQueue].clear();
@@ -271,6 +278,7 @@ void CachedBinning(
 		MexVector<__m128i> BinningBuffer(CacheBuffering*nBins);	//each element is 16 bytes
 		MexVector<int> BufferInsertIndex(nBins, 0);
 
+		SpikeStoreBeg = chrono::system_clock::now();
 		for (int j = 0; j < N; ++j){
 			VSim[j] += (Iin[j] - VSim[j]);
 			if (NeuronSelectionVector[temp][j]){
@@ -319,13 +327,18 @@ void CachedBinning(
 			}
 			BufferInsertIndex[i] = 0;
 		}
+		SpikeStoreEnd = chrono::system_clock::now();
+		SpikeStoreTotal += chrono::duration_cast<chrono::microseconds>(SpikeStoreEnd - SpikeStoreBeg).count();
+
 		CurrentQueue = NextQueue;
 	}
 	for (int i = 0; i < nBins; ++i){
 		int CurrentQueueTemp = (CurrentQueue + i) % nBins;
 		TotalSpikes += SpikeQueue[CurrentQueueTemp].size();
 	}
-	
+	std::cout << "Time in spike queue processing = " << SpikeQueueProcTotal << " milliseconds" << endl;
+	std::cout << "Time in spike storing = " << SpikeStoreTotal << " milliseconds" << endl;
+
 	//cout << "Number of actual iterations = " << TotalSpikesTemp << endl;
 }
 int main(){
@@ -413,14 +426,14 @@ int main(){
 			}
 		}
 	}
-	cout << "Just 4 Kicks: " << pseudoV[1] << pseudoIin[1] << endl;
+	std::cout << "Just 4 Kicks: " << pseudoV[1] << pseudoIin[1] << endl;
 	TotalSpikesEstimate = (float)(TotalSpikesEstimate) / 8 * nSteps;
 	if (WeightQueue.size() == Range){
 		for (int i = 0; i < Range; ++i)
-			cout << WeightQueue[i].capacity() << endl;
+			std::cout << WeightQueue[i].capacity() << endl;
 	}
-	cout << "no of spikes estimated = " << TotalSpikesEstimate << endl;
-	cout << "no of spikes stored = " << TotalSpikes << endl;
-	cout << "Dis Shit Tuk " << chrono::duration_cast<chrono::milliseconds>(TEnd - TBeg).count() << " ms" << endl;
-	system("pause");
+	std::cout << "no of spikes estimated = " << TotalSpikesEstimate << endl;
+	std::cout << "no of spikes stored = " << TotalSpikes << endl;
+	std::cout << "Dis Shit Tuk " << chrono::duration_cast<chrono::milliseconds>(TEnd - TBeg).count() << " ms" << endl;
+	std::system("pause");
 }
